@@ -65,43 +65,51 @@ class DropOutEnrollments extends Command
      * 4. Update the enrollment status to `DROPOUT`.
      * 5. Create an activity log for the student.
      */
-    private function dropOutEnrollmentsBefore(Carbon $deadline)
+    private function dropOutEnrollmentsBefore(Carbon $deadline): void
     {
-        $enrollmentsToBeDroppedOut = Enrollment::where('deadline_at', '<=', $deadline)->get();
+        // Fetch enrollments that are eligible for dropout
+        $enrollments = Enrollment::where('deadline_at', '<=', $deadline)
+            ->whereNotExists(function ($query) {
+                $query->select(DB::raw(1))
+                    ->from('exams')
+                    ->whereColumn('exams.course_id', 'enrollments.course_id')
+                    ->whereColumn('exams.student_id', 'enrollments.student_id')
+                    ->where('exams.status', 'IN_PROGRESS');
+            })
+            ->whereNotExists(function ($query) {
+                $query->select(DB::raw(1))
+                    ->from('submissions')
+                    ->whereColumn('submissions.course_id', 'enrollments.course_id')
+                    ->whereColumn('submissions.student_id', 'enrollments.student_id')
+                    ->where('submissions.status', 'WAITING_REVIEW');
+            })
+            ->select('id', 'student_id')
+            ->get();
 
-        $this->info('Enrollments to be dropped out: ' . count($enrollmentsToBeDroppedOut));
-        $droppedOutEnrollments = 0;
-
-        foreach ($enrollmentsToBeDroppedOut as $enrollment) {
-            $hasActiveExam = Exam::where('course_id', $enrollment->course_id)
-                ->where('student_id', $enrollment->student_id)
-                ->where('status', 'IN_PROGRESS')
-                ->exists();
-
-            $hasWaitingReviewSubmission = Submission::where('course_id', $enrollment->course_id)
-                ->where('student_id', $enrollment->student_id)
-                ->where('status', 'WAITING_REVIEW')
-                ->exists();
-
-            if ($hasActiveExam || $hasWaitingReviewSubmission) {
-                continue;
-            }
-
-            $enrollment->update([
-                'status' => 'DROPOUT',
-                'updated_at' => now(),
-            ]);
-
-            Activity::create([
-                'resource_id' => $enrollment->id,
-                'user_id' => $enrollment->student_id,
-                'description' => 'COURSE_DROPOUT',
-            ]);
-
-            $droppedOutEnrollments++;
+        if ($enrollments->isEmpty()) {
+            return;
         }
 
-        $this->info('Excluded from drop out: ' . count($enrollmentsToBeDroppedOut) - $droppedOutEnrollments);
-        $this->info('Final dropped out enrollments: ' . $droppedOutEnrollments);
+        // Bulk update enrollments to 'DROPOUT' status
+        $enrollments->chunk(1000)->each(function ($chunk) {
+            Enrollment::whereIn('id', $chunk->pluck('id'))
+                ->update(['status' => 'DROPOUT', 'updated_at' => now()]);
+        });
+
+
+        // Bulk insert activity logs
+        $activities = $enrollments->map(fn($enrollment) => [
+            'resource_id' => $enrollment->id,
+            'user_id' => $enrollment->student_id,
+            'description' => 'COURSE_DROPOUT',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ])->toArray();
+
+        collect($activities)->chunk(1000)->each(function ($chunk) {
+            Activity::insert($chunk->toArray());
+        });
+
+        $this->info('Final dropped out enrollments: ' . $enrollments->count());
     }
 }
